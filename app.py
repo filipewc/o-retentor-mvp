@@ -768,7 +768,6 @@ def injetar_css():
     /* ── Ocultar elementos padrao do Streamlit ── */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
 
