@@ -2,7 +2,8 @@
 O Retentor — Pilar 1: Motor de Congruencia · Dashboard
 ========================================================
 Dashboard Streamlit para pitch de vendas executivo.
-Analisa congruencia entre anuncios e artigos de blog via Gemini.
+Analisa congruencia textual e visual entre anuncios e artigos
+de blog via Gemini (multimodal).
 
 Executar: streamlit run app.py
 """
@@ -10,7 +11,7 @@ Executar: streamlit run app.py
 import json
 import time
 import textwrap
-from io import StringIO
+from io import StringIO, BytesIO
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -18,12 +19,13 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from PIL import Image
 import google.generativeai as genai
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Constantes do Motor
-# ══════════════════════════════════════════════
+# ====================================================================
 
 HEADERS_NAVEGADOR = {
     "User-Agent": (
@@ -46,31 +48,47 @@ SELETORES_CONTEUDO = [
 
 LIMITE_PALAVRAS = 5_000
 
+# Dimensao maxima do thumbnail exibido na UI
+THUMBNAIL_MAX = (180, 180)
+
 PROMPT_SISTEMA = textwrap.dedent("""\
-    Você é um copywriter sênior especialista em retenção de leitores para blogs.
-    Sua função é avaliar se o conteúdo de um artigo CUMPRE a promessa feita no
-    anúncio que trouxe o leitor até a página.
+    Voce e um especialista senior em retencao de trafego e copywriting
+    para blogs monetizados com publicidade.
 
-    Um leitor que clica em um anúncio cria uma expectativa imediata. Se os
-    primeiros parágrafos do artigo não entregam essa expectativa, ele abandona
-    a página — e a receita cai.
+    Voce recebera:
+    - TEXTO DO ANUNCIO: a copy textual que o leitor viu antes de clicar.
+    - TEXTO DO ARTIGO: o conteudo completo (ou parcial) do blog de destino.
+    - IMAGEM DO CRIATIVO (opcional): a peca visual do anuncio que gerou o clique.
 
-    Você receberá:
-    - TEXTO DO ANÚNCIO: a copy que o leitor viu antes de clicar.
-    - TEXTO DO ARTIGO: o conteúdo completo (ou parcial) do blog.
+    Sua funcao e avaliar se o conteudo do artigo CUMPRE a promessa feita
+    no anuncio — tanto a promessa textual quanto a promessa visual, quando
+    a imagem do criativo for fornecida.
 
-    Critérios para o score:
-    - 90-100: Congruência perfeita. O artigo entrega exatamente o que o anúncio
-              promete, logo nos primeiros parágrafos.
-    - 70-89:  Boa congruência. A promessa é cumprida, mas poderia ser mais
-              direta no início.
-    - 50-69:  Congruência parcial. O tema é o mesmo, mas a promessa específica
-              do anúncio demora ou não aparece com clareza.
-    - 30-49:  Congruência fraca. O artigo tangencia o tema, mas o leitor
-              provavelmente se sentirá enganado.
-    - 0-29:   Incongruente. O artigo não tem relação relevante com a promessa.
+    Quando a imagem estiver presente, avalie:
+    - Se o tom visual (cores, estilo, tema) do criativo e coerente com o
+      conteudo e o tom do artigo.
+    - Se elementos visuais do criativo (produtos, cenarios, pessoas, graficos)
+      sao mencionados ou entregues nos primeiros paragrafos do artigo.
+    - Se existe quebra de expectativa visual: o criativo promete uma coisa
+      visualmente e o artigo entrega outra.
 
-    Seja direto, prático e acionável na sugestão.
+    Quando apenas o texto do anuncio for fornecido (sem imagem), avalie
+    exclusivamente a congruencia textual.
+
+    Criterios para o score:
+    - 90-100: Congruencia perfeita. O artigo entrega exatamente o que o
+              anuncio promete (visual e textualmente), logo nos primeiros
+              paragrafos.
+    - 70-89:  Boa congruencia. A promessa e cumprida, mas poderia ser mais
+              direta no inicio.
+    - 50-69:  Congruencia parcial. O tema e o mesmo, mas a promessa
+              especifica do anuncio demora ou nao aparece com clareza.
+    - 30-49:  Congruencia fraca. O artigo tangencia o tema, mas o leitor
+              provavelmente se sentira enganado.
+    - 0-29:   Incongruente. O artigo nao tem relacao relevante com a
+              promessa do anuncio.
+
+    Seja direto, pratico e acionavel na sugestao.
 """)
 
 SCHEMA_RESPOSTA = {
@@ -78,19 +96,19 @@ SCHEMA_RESPOSTA = {
     "properties": {
         "score_congruencia": {
             "type": "integer",
-            "description": "Score de 0 a 100 indicando alinhamento entre anúncio e artigo",
+            "description": "Score de 0 a 100 indicando alinhamento entre anuncio e artigo",
         },
         "diagnostico": {
             "type": "string",
-            "description": "Diagnóstico de 2 a 4 frases sobre a congruência encontrada",
+            "description": "Diagnostico de 2 a 4 frases sobre a congruencia encontrada",
         },
         "promessa_entregue_no_inicio": {
             "type": "boolean",
-            "description": "True se a promessa do anúncio aparece nos primeiros parágrafos",
+            "description": "True se a promessa do anuncio aparece nos primeiros paragrafos",
         },
         "sugestao_primeiro_paragrafo": {
             "type": "string",
-            "description": "Sugestão prática de reescrita do primeiro parágrafo para reter o leitor",
+            "description": "Sugestao pratica de reescrita do primeiro paragrafo para reter o leitor",
         },
     },
     "required": [
@@ -102,9 +120,9 @@ SCHEMA_RESPOSTA = {
 }
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Dataclass de Resultado
-# ══════════════════════════════════════════════
+# ====================================================================
 
 @dataclass
 class ResultadoAnalise:
@@ -115,6 +133,7 @@ class ResultadoAnalise:
     diagnostico: Optional[str] = None
     sugestao_primeiro_paragrafo: Optional[str] = None
     status_erro: Optional[str] = None
+    com_imagem: bool = False
 
     @property
     def sucesso(self) -> bool:
@@ -126,9 +145,9 @@ class ResultadoAnalise:
         return d
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Motor de Scraping
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def extrair_texto_blog(url: str, timeout: int = 15) -> str:
     url = url.strip()
@@ -177,9 +196,32 @@ def extrair_texto_blog(url: str, timeout: int = 15) -> str:
     return texto
 
 
-# ══════════════════════════════════════════════
-#  Motor de Analise (Gemini)
-# ══════════════════════════════════════════════
+# ====================================================================
+#  Processamento de Imagem
+# ====================================================================
+
+def processar_imagem_upload(arquivo_upload) -> Image.Image:
+    """Abre e valida a imagem enviada pelo usuario."""
+    try:
+        imagem = Image.open(arquivo_upload)
+        # Converte para RGB se necessario (ex: RGBA, P)
+        if imagem.mode not in ("RGB", "L"):
+            imagem = imagem.convert("RGB")
+        return imagem
+    except Exception as e:
+        raise RuntimeError(f"Erro ao processar imagem: {e}")
+
+
+def gerar_thumbnail(imagem: Image.Image, max_size: tuple = THUMBNAIL_MAX) -> Image.Image:
+    """Gera uma copia reduzida para exibicao na interface."""
+    thumb = imagem.copy()
+    thumb.thumbnail(max_size, Image.LANCZOS)
+    return thumb
+
+
+# ====================================================================
+#  Motor de Analise (Gemini) — Multimodal
+# ====================================================================
 
 def criar_modelo(api_key: str) -> genai.GenerativeModel:
     genai.configure(api_key=api_key)
@@ -198,16 +240,36 @@ def analisar_congruencia(
     modelo: genai.GenerativeModel,
     texto_anuncio: str,
     texto_artigo: str,
+    imagem: Optional[Image.Image] = None,
 ) -> dict:
+    """
+    Envia os textos (e opcionalmente a imagem) ao Gemini.
+    Se a imagem estiver presente, envia como conteudo multimodal.
+    """
+    modo = "textual e visual" if imagem else "textual"
+
     prompt = (
+        f"MODO DE ANALISE: {modo}\n\n"
         f"TEXTO DO ANUNCIO:\n"
         f"---\n{texto_anuncio.strip()}\n---\n\n"
         f"TEXTO DO ARTIGO (primeiros paragrafos sao os mais importantes):\n"
         f"---\n{texto_artigo}\n---"
     )
 
+    if imagem:
+        prompt += (
+            "\n\nA imagem do criativo do anuncio esta anexada. "
+            "Analise a congruencia visual entre o criativo e o conteudo do artigo."
+        )
+
+    # Monta o conteudo: multimodal (lista) ou texto puro (string)
+    if imagem:
+        conteudo = [prompt, imagem]
+    else:
+        conteudo = prompt
+
     try:
-        resposta = modelo.generate_content(prompt)
+        resposta = modelo.generate_content(conteudo)
     except Exception as e:
         raise RuntimeError(f"Erro na API Gemini: {type(e).__name__}: {e}")
 
@@ -223,12 +285,21 @@ def analisar_congruencia(
     return resultado
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Pipeline completo (scraping + analise)
-# ══════════════════════════════════════════════
+# ====================================================================
 
-def executar_analise(modelo, url: str, texto_anuncio: str) -> ResultadoAnalise:
-    resultado = ResultadoAnalise(url_artigo=url, texto_anuncio=texto_anuncio)
+def executar_analise(
+    modelo,
+    url: str,
+    texto_anuncio: str,
+    imagem: Optional[Image.Image] = None,
+) -> ResultadoAnalise:
+    resultado = ResultadoAnalise(
+        url_artigo=url,
+        texto_anuncio=texto_anuncio,
+        com_imagem=imagem is not None,
+    )
 
     try:
         texto_artigo = extrair_texto_blog(url)
@@ -237,7 +308,7 @@ def executar_analise(modelo, url: str, texto_anuncio: str) -> ResultadoAnalise:
         return resultado
 
     try:
-        analise = analisar_congruencia(modelo, texto_anuncio, texto_artigo)
+        analise = analisar_congruencia(modelo, texto_anuncio, texto_artigo, imagem)
         resultado.score_congruencia = analise["score_congruencia"]
         resultado.promessa_entregue_no_inicio = analise["promessa_entregue_no_inicio"]
         resultado.diagnostico = analise["diagnostico"]
@@ -248,9 +319,9 @@ def executar_analise(modelo, url: str, texto_anuncio: str) -> ResultadoAnalise:
     return resultado
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  CSS — SaaS Premium, Tema Claro Forcado
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def injetar_css():
     st.markdown("""
@@ -286,7 +357,6 @@ def injetar_css():
         --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
     }
 
-    /* ── Tema claro forcado em tudo ──────────── */
     .stApp,
     .stApp > header,
     .main,
@@ -302,7 +372,6 @@ def injetar_css():
         padding-top: 2.5rem;
     }
 
-    /* ── Sidebar ─────────────────────────────── */
     section[data-testid="stSidebar"],
     section[data-testid="stSidebar"] > div {
         background-color: var(--bg-secondary) !important;
@@ -324,7 +393,6 @@ def injetar_css():
         color: var(--text-secondary) !important;
     }
 
-    /* ── Tipografia geral ────────────────────── */
     .stMarkdown, .stMarkdown p, .stMarkdown li,
     label, .stTextInput label, .stTextArea label {
         font-family: 'DM Sans', sans-serif !important;
@@ -335,7 +403,6 @@ def injetar_css():
         color: var(--text-primary) !important;
     }
 
-    /* ── Hero ─────────────────────────────────── */
     .hero-wrapper {
         padding-bottom: 1.75rem;
         margin-bottom: 1.5rem;
@@ -368,7 +435,6 @@ def injetar_css():
         max-width: 620px;
     }
 
-    /* ── Score card ───────────────────────────── */
     .score-card {
         background: var(--bg-primary);
         border: 1px solid var(--border-light);
@@ -425,7 +491,26 @@ def injetar_css():
     .level-mid  .score-classification { color: var(--score-mid); }
     .level-low  .score-classification { color: var(--score-low); }
 
-    /* ── Promise indicator ───────────────────── */
+    .score-mode-tag {
+        display: inline-block;
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.58rem;
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        padding: 2px 8px;
+        border-radius: 3px;
+        margin-top: 0.6rem;
+    }
+    .mode-textual {
+        background: var(--accent-light);
+        color: var(--accent);
+    }
+    .mode-multimodal {
+        background: #F3E8FD;
+        color: #7C3AED;
+    }
+
     .promise-indicator {
         display: inline-flex;
         align-items: center;
@@ -447,7 +532,6 @@ def injetar_css():
         color: var(--score-low);
     }
 
-    /* ── Info card ────────────────────────────── */
     .info-card {
         background: var(--bg-primary);
         border: 1px solid var(--border-light);
@@ -475,7 +559,29 @@ def injetar_css():
         line-height: 1.65;
     }
 
-    /* ── Tabs ─────────────────────────────────── */
+    .thumbnail-frame {
+        display: inline-block;
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-light);
+        border-radius: var(--radius-sm);
+        padding: 6px;
+        line-height: 0;
+    }
+    .thumbnail-frame img {
+        border-radius: 3px;
+        max-height: 140px;
+        width: auto;
+    }
+    .thumbnail-caption {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 0.58rem;
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        margin-top: 0.4rem;
+    }
+
     .stTabs [data-baseweb="tab-list"] {
         gap: 0;
         background: var(--bg-secondary);
@@ -501,7 +607,6 @@ def injetar_css():
         padding-top: 1.5rem;
     }
 
-    /* ── Buttons ──────────────────────────────── */
     .stButton > button {
         font-family: 'DM Sans', sans-serif !important;
         font-weight: 600 !important;
@@ -519,7 +624,6 @@ def injetar_css():
         box-shadow: 0 2px 8px rgba(26, 115, 232, 0.2);
     }
 
-    /* ── Inputs ───────────────────────────────── */
     .stTextInput input, .stTextArea textarea {
         background: var(--bg-primary) !important;
         border: 1px solid var(--border-medium) !important;
@@ -536,7 +640,6 @@ def injetar_css():
         color: var(--text-muted) !important;
     }
 
-    /* ── File uploader ───────────────────────── */
     [data-testid="stFileUploader"] {
         background: var(--bg-secondary);
         border: 1px dashed var(--border-medium);
@@ -544,7 +647,6 @@ def injetar_css():
         padding: 0.75rem;
     }
 
-    /* ── Download button ─────────────────────── */
     .stDownloadButton > button {
         font-family: 'DM Sans', sans-serif !important;
         font-weight: 600 !important;
@@ -558,12 +660,10 @@ def injetar_css():
         background: var(--accent-light) !important;
     }
 
-    /* ── Progress bar ────────────────────────── */
     .stProgress > div > div {
         background: var(--accent) !important;
     }
 
-    /* ── Batch row ───────────────────────────── */
     .batch-row {
         display: flex;
         align-items: center;
@@ -618,7 +718,6 @@ def injetar_css():
         border-radius: 2px;
     }
 
-    /* ── Metric row ──────────────────────────── */
     .metric-row {
         display: flex;
         gap: 0.75rem;
@@ -649,7 +748,6 @@ def injetar_css():
         line-height: 1;
     }
 
-    /* ── Sidebar branding ────────────────────── */
     .sidebar-brand {
         font-family: 'Source Serif 4', serif;
         font-size: 1.1rem;
@@ -685,7 +783,6 @@ def injetar_css():
         margin-bottom: 0.5rem;
     }
 
-    /* ── Lock screen ─────────────────────────── */
     .lock-card {
         text-align: center;
         padding: 2.75rem 2.5rem;
@@ -726,7 +823,6 @@ def injetar_css():
         line-height: 1.55;
     }
 
-    /* ── Expander ─────────────────────────────── */
     .streamlit-expanderHeader {
         font-family: 'DM Sans', sans-serif !important;
         font-weight: 500 !important;
@@ -736,14 +832,12 @@ def injetar_css():
         border-radius: var(--radius-sm) !important;
     }
 
-    /* ── Alerts ───────────────────────────────── */
     [data-testid="stAlert"] {
         font-family: 'DM Sans', sans-serif !important;
         font-size: 0.85rem;
         border-radius: var(--radius-sm);
     }
 
-    /* ── Status widget ───────────────────────── */
     [data-testid="stStatusWidget"] {
         font-family: 'DM Sans', sans-serif !important;
         background: var(--bg-secondary) !important;
@@ -751,30 +845,28 @@ def injetar_css():
         border-radius: var(--radius-md) !important;
     }
 
-    /* ── JSON viewer ─────────────────────────── */
     [data-testid="stJson"] {
         background: var(--bg-secondary) !important;
         border: 1px solid var(--border-light) !important;
         border-radius: var(--radius-sm) !important;
     }
 
-    /* ── Code block ──────────────────────────── */
     .stCodeBlock, code, pre {
         background: var(--bg-secondary) !important;
         color: var(--text-primary) !important;
         border: 1px solid var(--border-light) !important;
     }
 
-    /* ── Ocultar elementos padrao do Streamlit ── */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+    header {visibility: hidden;}
     </style>
     """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Componentes de UI
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def render_hero():
     st.markdown("""
@@ -782,8 +874,9 @@ def render_hero():
             <div class="hero-eyebrow">Pilar 1 &mdash; Motor de Congruencia</div>
             <h1 class="hero-title">O Retentor</h1>
             <p class="hero-subtitle">
-                Identifica desalinhamentos entre a promessa do anuncio e o conteudo
-                do artigo que geram abandono de pagina e perda de receita publicitaria.
+                Identifica desalinhamentos entre a promessa do anuncio (textual e visual)
+                e o conteudo do artigo que geram abandono de pagina e perda de receita
+                publicitaria.
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -798,14 +891,18 @@ def _score_level(score: int) -> tuple[str, str]:
         return "level-low", "Congruencia fraca &mdash; alta probabilidade de rejeicao"
 
 
-def render_score_card(score: int, promessa_entregue: bool):
+def render_score_card(score: int, promessa_entregue: bool, com_imagem: bool = False):
     nivel, classificacao = _score_level(score)
+
+    modo_cls = "mode-multimodal" if com_imagem else "mode-textual"
+    modo_txt = "ANALISE MULTIMODAL" if com_imagem else "ANALISE TEXTUAL"
 
     st.markdown(f"""
         <div class="score-card {nivel}">
             <div class="score-eyebrow">Score de Congruencia</div>
             <div class="score-value">{score}<span class="score-suffix"> / 100</span></div>
             <div class="score-classification">{classificacao}</div>
+            <div class="score-mode-tag {modo_cls}">{modo_txt}</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -843,7 +940,11 @@ def render_resultado_completo(resultado: ResultadoAnalise):
         st.error(f"Erro na analise: {resultado.status_erro}")
         return
 
-    render_score_card(resultado.score_congruencia, resultado.promessa_entregue_no_inicio)
+    render_score_card(
+        resultado.score_congruencia,
+        resultado.promessa_entregue_no_inicio,
+        resultado.com_imagem,
+    )
 
     st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
@@ -859,7 +960,26 @@ def render_resultado_completo(resultado: ResultadoAnalise):
             "promessa_entregue_no_inicio": resultado.promessa_entregue_no_inicio,
             "diagnostico": resultado.diagnostico,
             "sugestao_primeiro_paragrafo": resultado.sugestao_primeiro_paragrafo,
+            "modo_analise": "multimodal" if resultado.com_imagem else "textual",
         })
+
+
+def render_thumbnail(imagem: Image.Image):
+    """Exibe miniatura da imagem com moldura elegante."""
+    thumb = gerar_thumbnail(imagem)
+    buf = BytesIO()
+    thumb.save(buf, format="PNG")
+    buf.seek(0)
+
+    import base64
+    b64 = base64.b64encode(buf.read()).decode()
+
+    st.markdown(f"""
+        <div class="thumbnail-frame">
+            <img src="data:image/png;base64,{b64}" alt="Criativo do anuncio" />
+        </div>
+        <div class="thumbnail-caption">Criativo anexado</div>
+    """, unsafe_allow_html=True)
 
 
 def render_batch_row(resultado: ResultadoAnalise):
@@ -927,15 +1047,15 @@ def render_batch_summary(resultados: list[ResultadoAnalise]):
     """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Sidebar
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def render_sidebar() -> Optional[str]:
     with st.sidebar:
         st.markdown("""
             <div class="sidebar-brand">O Retentor</div>
-            <div class="sidebar-tag">PILAR 1 &middot; v2.0</div>
+            <div class="sidebar-tag">PILAR 1 &middot; v3.0 MULTIMODAL</div>
         """, unsafe_allow_html=True)
 
         st.markdown('<div class="sidebar-hr"></div>', unsafe_allow_html=True)
@@ -958,27 +1078,34 @@ def render_sidebar() -> Optional[str]:
 
         st.markdown("""
             O Motor de Congruencia compara a promessa do
-            anuncio com o conteudo real do artigo de destino.
+            anuncio — textual e visual — com o conteudo
+            real do artigo de destino.
 
-            Quando o leitor nao encontra nos primeiros
-            paragrafos aquilo que foi prometido, a taxa de
-            rejeicao dispara e a receita publicitaria e
-            comprometida.
+            Na versao multimodal, a imagem do criativo do
+            anuncio e analisada pela IA para detectar
+            quebras de expectativa visual que causam
+            abandono de pagina.
+        """)
 
-            Esta ferramenta identifica o problema e entrega
-            uma recomendacao de correcao acionavel.
+        st.markdown('<div class="sidebar-hr"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="sidebar-section">Capacidades</div>', unsafe_allow_html=True)
+        st.markdown("""
+            - Analise textual (anuncio vs artigo)
+            - Analise visual (criativo vs artigo)
+            - Processamento em lote via CSV
+            - Relatorio exportavel
         """)
 
         st.markdown('<div class="sidebar-hr"></div>', unsafe_allow_html=True)
         st.markdown('<div class="sidebar-section">Stack Tecnologica</div>', unsafe_allow_html=True)
-        st.code("Gemini 2.5 Flash Lite\nBeautifulSoup4\nStreamlit\nPandas", language=None)
+        st.code("Gemini 2.5 Flash Lite\nBeautifulSoup4\nStreamlit\nPillow\nPandas", language=None)
 
     return api_key if api_key else None
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Tela de Bloqueio
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def render_lock_screen():
     st.markdown("<div style='height:4rem'></div>", unsafe_allow_html=True)
@@ -1002,9 +1129,9 @@ def render_lock_screen():
         """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════
-#  Aba 1 — Teste ao Vivo
-# ══════════════════════════════════════════════
+# ====================================================================
+#  Aba 1 — Teste ao Vivo (com upload de imagem)
+# ====================================================================
 
 def render_tab_ao_vivo(api_key: str):
     col_url, col_ad = st.columns([3, 2])
@@ -1022,6 +1149,26 @@ def render_tab_ao_vivo(api_key: str):
             height=100,
         )
 
+    # Upload de criativo (opcional)
+    col_upload, col_preview = st.columns([2, 1])
+
+    with col_upload:
+        arquivo_imagem = st.file_uploader(
+            "Faca o upload da imagem do Criativo (Opcional)",
+            type=["png", "jpg", "jpeg"],
+            help="Formatos aceitos: PNG, JPG, JPEG. A imagem sera analisada pela IA junto com o texto.",
+        )
+
+    imagem = None
+    with col_preview:
+        if arquivo_imagem is not None:
+            try:
+                imagem = processar_imagem_upload(arquivo_imagem)
+                render_thumbnail(imagem)
+            except RuntimeError as e:
+                st.error(f"Erro ao processar imagem: {e}")
+                imagem = None
+
     st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
 
     if st.button("Gerar Diagnostico", use_container_width=True, type="primary"):
@@ -1030,8 +1177,9 @@ def render_tab_ao_vivo(api_key: str):
             return
 
         modelo = criar_modelo(api_key)
+        modo_label = "multimodal (texto + imagem)" if imagem else "textual"
 
-        with st.status("Analisando congruencia...", expanded=True) as status:
+        with st.status(f"Analisando congruencia ({modo_label})...", expanded=True) as status:
             st.write("Extraindo texto do artigo...")
             try:
                 texto_artigo = extrair_texto_blog(url)
@@ -1042,9 +1190,13 @@ def render_tab_ao_vivo(api_key: str):
                 st.error(f"Erro no scraping: {e}")
                 return
 
-            st.write("Enviando para analise via Gemini...")
+            if imagem:
+                st.write("Enviando texto e imagem para analise via Gemini...")
+            else:
+                st.write("Enviando texto para analise via Gemini...")
+
             try:
-                analise = analisar_congruencia(modelo, anuncio, texto_artigo)
+                analise = analisar_congruencia(modelo, anuncio, texto_artigo, imagem)
             except RuntimeError as e:
                 status.update(label="Falha na analise", state="error")
                 st.error(f"Erro na API: {e}")
@@ -1059,20 +1211,26 @@ def render_tab_ao_vivo(api_key: str):
             promessa_entregue_no_inicio=analise["promessa_entregue_no_inicio"],
             diagnostico=analise["diagnostico"],
             sugestao_primeiro_paragrafo=analise["sugestao_primeiro_paragrafo"],
+            com_imagem=imagem is not None,
         )
 
         st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
         render_resultado_completo(resultado)
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  Aba 2 — Processamento em Lote
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def render_tab_lote(api_key: str):
     st.markdown("""
         Faca upload do arquivo CSV contendo as colunas
         `url_artigo` e `texto_anuncio`.
+    """)
+
+    st.markdown("""
+        *Nota: o processamento em lote utiliza analise textual.
+        Para analise multimodal com imagem, utilize a aba Teste ao Vivo.*
     """)
 
     arquivo = st.file_uploader(
@@ -1130,7 +1288,7 @@ def render_tab_lote(api_key: str):
         for idx, row in df.iterrows():
             numero = idx + 1
             url = str(row["url_artigo"]).strip()
-            anuncio = str(row["texto_anuncio"]).strip()
+            anuncio_texto = str(row["texto_anuncio"]).strip()
 
             url_curta = url[:50] + "..." if len(url) > 50 else url
             progress_bar.progress(
@@ -1138,7 +1296,7 @@ def render_tab_lote(api_key: str):
                 text=f"Analisando {numero} de {total}: {url_curta}",
             )
 
-            resultado = executar_analise(modelo, url, anuncio)
+            resultado = executar_analise(modelo, url, anuncio_texto)
             resultados.append(resultado)
 
             with results_container:
@@ -1154,11 +1312,11 @@ def render_tab_lote(api_key: str):
 
         for r in resultados:
             if r.sucesso:
-                label = f"{r.url_artigo[:60]} — Score: {r.score_congruencia}"
+                label = f"{r.url_artigo[:60]} | Score: {r.score_congruencia}"
                 with st.expander(label):
                     render_resultado_completo(r)
             else:
-                label = f"{r.url_artigo[:60]} — Erro"
+                label = f"{r.url_artigo[:60]} | Erro"
                 with st.expander(label):
                     st.error(r.status_erro)
 
@@ -1182,9 +1340,9 @@ def render_tab_lote(api_key: str):
         )
 
 
-# ══════════════════════════════════════════════
+# ====================================================================
 #  App Principal
-# ══════════════════════════════════════════════
+# ====================================================================
 
 def main():
     st.set_page_config(
